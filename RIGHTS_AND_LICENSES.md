@@ -10,10 +10,9 @@ provided in `LICENSE`.
 
 ## Processed Data and Result Products
 
-The files in `data_usgs/`, `outputs/conventional/`, `outputs/final/`,
-`protocols/`, and `metadata/` are released as processed research data and
-analysis result products under the Creative Commons Attribution 4.0
-International License (CC BY 4.0).
+The files in `data_usgs/`, `outputs/conventional/`, `protocols/`, and
+`metadata/` are released as processed research data and analysis result products
+under the Creative Commons Attribution 4.0 International License (CC BY 4.0).
 
 These products were derived from public hydrologic and meteorological sources,
 including USGS NWIS, Daymet, and gridMET. The source products remain governed by
