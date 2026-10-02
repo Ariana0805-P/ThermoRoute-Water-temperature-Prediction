@@ -1,14 +1,15 @@
-# ThermoRoute Core Code and Data Release
+# ThermoRoute Core Code Release with Metadata and Result Summaries
 
-This repository is a public core code and data release for the manuscript:
+This repository is a public core code release with selected metadata and
+result-summary tables for the manuscript:
 
 > Benchmark design governs reported skill in daily river water-temperature
 > prediction
 
-It contains the core Python code, reproducibility metadata, public-source
-acquisition records, and result tables needed to inspect the main
-benchmark summaries. It is intentionally not a complete research working
-directory and not a full processed-data archive.
+It contains the core Python code, data-source and provenance metadata, and
+selected result tables needed to inspect the main benchmark summaries. It is
+intentionally not a complete research working directory, not a full data
+repository, and not a full processed-data archive.
 
 ## Contents
 
@@ -24,7 +25,7 @@ directory and not a full processed-data archive.
 - `protocols/`: selected benchmark-design and analysis protocols.
 - `metadata/`: release-scope notes and file checksums.
 - `RIGHTS_AND_LICENSES.md`: rights statement distinguishing software from
-  processed research data and third-party source products.
+  metadata/result-summary files and third-party source products.
 
 ## Not Included
 
