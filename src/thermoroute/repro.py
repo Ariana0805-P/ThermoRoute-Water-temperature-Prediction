@@ -1,0 +1,1492 @@
+"""Content-addressed experiment and artifact utilities.
+
+The research scripts used to treat a filename such as ``seed0.parquet`` as a
+checkpoint.  That permits a file produced by one panel, configuration, or source
+tree to be silently reused by another.  This module makes the experiment identity
+explicit and validates a sidecar before any cache hit is accepted.
+
+Only stable inputs enter ``run_id``.  The numerical runtime contract (interpreter,
+dependency, accelerator, OS ABI, and CPU capability versions) is an input because
+reusing a cache produced by another numerical stack or host class is not a
+reproducible cache hit.  This supports same-declared-host-class replay; bitwise
+agreement across different hardware is not claimed.  Volatile or identifying
+facts such as timestamp, hostname, serial number, core count, frequency, and
+duration remain provenance only.
+"""
+
+from __future__ import annotations
+
+import atexit
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import datetime, timezone
+import errno
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import socket
+import stat as stat_module
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+from typing import Any, Callable, Iterable, Iterator, Mapping, TextIO
+
+
+RUN_SCHEMA_VERSION = "thermoroute.run.v2"
+ARTIFACT_SCHEMA_VERSION = "thermoroute.artifact.v1"
+RUN_LOCK_SCHEMA_VERSION = "thermoroute.run-lock.v1"
+DARWIN_SYSCTL_PATH = "/usr/sbin/sysctl"
+
+FORMAL_THREAD_ENVIRONMENT = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
+_FORMAL_THREADPOOL_CONTROLLER: Any | None = None
+_NATIVE_BINARY_HASH_CACHE: dict[tuple[str, int, int], str] = {}
+_FORMAL_NATIVE_USER_APIS = frozenset({"blas", "openmp"})
+
+
+def _formal_thread_limit() -> int:
+    """Return the per-process native thread cap declared for this process.
+
+    ``THERMOROUTE_FORMAL_THREADS`` is a fixed execution policy per formal
+    process (seed workers, control members, replay workers each declare their
+    own cap).  The value is deliberately fixed at import time so the same
+    process cannot drift between the declared policy and the live pools.
+    """
+    raw = os.environ.get("THERMOROUTE_FORMAL_THREADS") or "1"
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "THERMOROUTE_FORMAL_THREADS must be a positive integer"
+        ) from exc
+    if limit < 1:
+        raise RuntimeError("THERMOROUTE_FORMAL_THREADS must be a positive integer")
+    return limit
+
+
+FORMAL_THREAD_LIMIT = _formal_thread_limit()
+NUMERICAL_POLICY_DOCUMENT_PATH = (
+    "protocols/route_a_numerical_policy_v2.json"
+)
+
+
+def formal_policy_document(root: str | Path) -> dict[str, Any]:
+    """Load the frozen numerical-policy document.
+
+    This document is the single source of truth for role thread caps and
+    replay tolerances; the ambient ``THERMOROUTE_FORMAL_THREADS`` value must
+    equal the role cap, never define it.
+    """
+    path = Path(root).resolve() / NUMERICAL_POLICY_DOCUMENT_PATH
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "numerical policy document is missing or invalid"
+        ) from exc
+    if (
+        not isinstance(doc, dict)
+        or doc.get("format") != "thermoroute.route-a-numerical-policy.v2"
+    ):
+        raise RuntimeError("numerical policy document format changed")
+    return doc
+
+
+def assert_role_thread_cap(root: str | Path, role: str) -> int:
+    """Fail closed when the process-declared cap differs from the frozen
+    role cap in the numerical-policy document."""
+    doc = formal_policy_document(root)
+    caps = doc.get("role_thread_caps")
+    if (
+        not isinstance(caps, Mapping)
+        or type(role) is not str
+        or role not in caps
+    ):
+        raise RuntimeError("numerical policy role caps are invalid")
+    expected = caps[role]
+    if type(expected) is not int or expected < 1:
+        raise RuntimeError("numerical policy role cap is invalid")
+    if FORMAL_THREAD_LIMIT != expected:
+        raise RuntimeError(
+            "process thread cap "
+            f"{FORMAL_THREAD_LIMIT} differs from the frozen policy cap "
+            f"{expected} for role {role}"
+        )
+    return expected
+
+
+def numerical_policy_role_cap(root: str | Path, role: str) -> int:
+    """Return the frozen role cap without asserting the live process cap."""
+    doc = formal_policy_document(root)
+    caps = doc.get("role_thread_caps")
+    if (
+        not isinstance(caps, Mapping)
+        or type(role) is not str
+        or role not in caps
+    ):
+        raise RuntimeError("numerical policy role caps are invalid")
+    expected = caps[role]
+    if type(expected) is not int or expected < 1:
+        raise RuntimeError("numerical policy role cap is invalid")
+    return expected
+
+
+def numerical_policy_document_sha256(root: str | Path) -> str:
+    """Return the policy-document digest used by execution authorizations."""
+    path = Path(root).resolve() / NUMERICAL_POLICY_DOCUMENT_PATH
+    return sha256_file(path)
+
+
+def _loaded_native_threadpools() -> list[dict[str, Any]]:
+    """Return the live ``threadpoolctl`` view or fail closed.
+
+    Environment variables are only declarations.  A formal run must also
+    prove that every BLAS/OpenMP runtime already loaded in this process has
+    actually adopted the one-thread policy.
+    """
+    try:
+        from threadpoolctl import threadpool_info
+
+        value = threadpool_info()
+    except Exception as exc:  # pragma: no cover - exercised via injected loader
+        raise RuntimeError(
+            "formal run cannot inspect loaded BLAS/OpenMP thread pools"
+        ) from exc
+    if not isinstance(value, list):
+        raise RuntimeError("native thread-pool inspection returned a malformed value")
+    return value
+
+
+def _assert_native_threadpools_within_limit(
+    value: object, limit: int = FORMAL_THREAD_LIMIT,
+) -> None:
+    """Reject an absent, malformed, unknown, or over-limit thread-pool view."""
+    if not isinstance(value, list) or not value:
+        raise RuntimeError(
+            "formal run requires at least one inspectable BLAS/OpenMP thread pool"
+        )
+    for index, pool in enumerate(value):
+        if not isinstance(pool, Mapping):
+            raise RuntimeError(
+                f"native thread-pool record {index} is malformed"
+            )
+        user_api = pool.get("user_api")
+        if type(user_api) is not str or user_api not in _FORMAL_NATIVE_USER_APIS:
+            raise RuntimeError(
+                f"native thread-pool record {index} has unknown user_api"
+            )
+        threads = pool.get("num_threads")
+        if (
+            type(threads) is not int
+            or threads < 1
+            or threads > limit
+        ):
+            raise RuntimeError(
+                "formal run requires every loaded BLAS/OpenMP pool to report "
+                f"between one and the declared cap {limit} threads; record "
+                f"{index} ({user_api}) did not"
+            )
+
+
+def _lexical_final_path(path: str | Path) -> Path:
+    """Resolve only a path's parent, preserving the final component for O_NOFOLLOW."""
+    requested = Path(path).expanduser()
+    if requested.name in {"", ".", ".."}:
+        raise ValueError("lock path must have a safe final component")
+    requested.parent.mkdir(parents=True, exist_ok=True)
+    return requested.parent.resolve() / requested.name
+
+
+def _open_owner_private_lock_file(path: Path) -> int:
+    """Open one non-symlink, owner-private, single-link regular lock file."""
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat_module.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+        ):
+            raise RuntimeError("lock is not an owner-private single-link regular file")
+        os.fchmod(descriptor, 0o600)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+@contextmanager
+def advisory_file_lock(
+    path: str | Path, *, exclusive: bool
+) -> Iterator[Path]:
+    """Hold one owner-private POSIX advisory lock for a complete transaction.
+
+    The lock file is coordination state, not scientific evidence.  Callers must
+    keep this context open across both validation and every dependent read/write.
+    Symlinks, non-regular files, foreign ownership, and external hard links fail
+    closed before ``flock`` is taken.
+    """
+    lock_path = _lexical_final_path(path)
+    try:
+        descriptor = _open_owner_private_lock_file(lock_path)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(f"cannot open transaction lock: {lock_path}") from exc
+    try:
+        fcntl.flock(
+            descriptor,
+            fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
+        )
+        yield lock_path
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def configure_deterministic_runtime() -> dict[str, Any]:
+    """Apply and verify the formal capped-thread Torch/native policy."""
+    global _FORMAL_THREADPOOL_CONTROLLER
+    limit = FORMAL_THREAD_LIMIT
+    for name in FORMAL_THREAD_ENVIRONMENT:
+        os.environ[name] = str(limit)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    # Under ``python -I`` CPython ignores this variable while choosing its hash
+    # secret.  It is retained only as a compatibility declaration for
+    # non-isolated callers.  The formal contract is deliberately *not* a
+    # fixed-hash-secret claim: identity-bearing collections must be
+    # canonicalised and sorted before iteration or hashing.
+    os.environ["PYTHONHASHSEED"] = "0"
+    try:
+        from threadpoolctl import threadpool_limits
+
+        # Retain the controller for the process lifetime.  A temporary context
+        # would restore the previous limits before training starts.
+        _FORMAL_THREADPOOL_CONTROLLER = threadpool_limits(limits=limit)
+    except Exception as exc:  # pragma: no cover - formal dependency failure
+        _FORMAL_THREADPOOL_CONTROLLER = None
+        raise RuntimeError(
+            "formal run cannot activate the native thread-pool limiter"
+        ) from exc
+    import torch
+
+    torch.set_num_threads(limit)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+    return assert_formal_numerical_policy()
+
+
+def formal_numerical_policy() -> dict[str, Any]:
+    """Return the effective launch policy that can change floating reductions."""
+    hash_policy = "canonical-sort-identity-collections-independent-of-hash-secret"
+    policy: dict[str, Any] = {
+        "thread_environment": {
+            name: os.environ.get(name) for name in FORMAL_THREAD_ENVIRONMENT
+        },
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        "python_hash_environment_declaration": os.environ.get("PYTHONHASHSEED"),
+        "python_hash_randomization_enabled": bool(sys.flags.hash_randomization),
+        "python_hash_policy": hash_policy,
+        "required": {
+            "threads": FORMAL_THREAD_LIMIT,
+            "cublas_workspace_config": ":4096:8",
+            "python_hash_policy": hash_policy,
+            "torch_deterministic_algorithms": True,
+            "tf32": False,
+            "float32_matmul_precision": "highest",
+        },
+    }
+    try:
+        import torch
+
+        policy["torch"] = {
+            "num_threads": int(torch.get_num_threads()),
+            "num_interop_threads": int(torch.get_num_interop_threads()),
+            "deterministic_algorithms": bool(
+                torch.are_deterministic_algorithms_enabled()
+            ),
+            "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+            "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+            "cuda_matmul_allow_tf32": bool(
+                torch.backends.cuda.matmul.allow_tf32
+            ),
+            "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        }
+    except ImportError:  # pragma: no cover - Torch is a formal dependency
+        policy["torch"] = None
+    return policy
+
+
+def assert_formal_numerical_policy(
+    *, require_hash_randomization: bool | None = None,
+) -> dict[str, Any]:
+    """Fail before training when effective thread/determinism knobs drift.
+
+    ``python -I`` intentionally chooses a fresh hash secret.  Formal entry
+    points may require that effective state while still obtaining stable run
+    identities from canonical sorting rather than from a fixed secret.
+    """
+    policy = formal_numerical_policy()
+    limit = FORMAL_THREAD_LIMIT
+    if any(
+        policy["thread_environment"].get(name) != str(limit)
+        for name in FORMAL_THREAD_ENVIRONMENT
+    ):
+        raise RuntimeError(
+            "formal run requires every BLAS/OpenMP thread count to equal the "
+            f"declared cap {limit}"
+        )
+    if policy["cublas_workspace_config"] != ":4096:8":
+        raise RuntimeError("formal run requires CUBLAS_WORKSPACE_CONFIG=:4096:8")
+    if policy["python_hash_policy"] != (
+        "canonical-sort-identity-collections-independent-of-hash-secret"
+    ):
+        raise RuntimeError("formal run requires hash-order-independent identities")
+    if (
+        require_hash_randomization is not None
+        and policy["python_hash_randomization_enabled"] is not require_hash_randomization
+    ):
+        expected = "enabled" if require_hash_randomization else "disabled"
+        raise RuntimeError(f"formal run requires Python hash randomization {expected}")
+    torch_policy = policy.get("torch")
+    expected_torch = {
+        "num_threads": limit,
+        "num_interop_threads": 1,
+        "deterministic_algorithms": True,
+        "cudnn_deterministic": True,
+        "cudnn_benchmark": False,
+        "cuda_matmul_allow_tf32": False,
+        "cudnn_allow_tf32": False,
+        "float32_matmul_precision": "highest",
+    }
+    if not isinstance(torch_policy, Mapping) or any(
+        torch_policy.get(key) != value for key, value in expected_torch.items()
+    ):
+        raise RuntimeError("formal Torch numerical policy is not active")
+    if _FORMAL_THREADPOOL_CONTROLLER is None:
+        raise RuntimeError("formal native thread-pool limiter is not active")
+    _assert_native_threadpools_within_limit(_loaded_native_threadpools())
+    return policy
+
+
+def sha256_file(path: str | Path, chunk_size: int = 1 << 20) -> str:
+    """Return the SHA-256 digest of ``path`` without loading it into memory."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _jsonable(value: Any) -> Any:
+    if is_dataclass(value) and not isinstance(value, type):
+        return _jsonable(asdict(value))  # type: ignore[arg-type]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(k): _jsonable(v) for k, v in sorted(value.items(), key=lambda x: str(x[0]))}
+    if isinstance(value, (tuple, list)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, set):
+        return sorted(_jsonable(v) for v in value)
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except (TypeError, ValueError):
+            pass
+    return value
+
+
+def canonical_json(value: Any) -> str:
+    """Canonical JSON used for configuration and lineage hashes."""
+    return json.dumps(_jsonable(value), sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def sha256_json(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _stable_text(value: Any) -> str | None:
+    """Normalise stable system metadata without retaining formatting noise."""
+    if value is None:
+        return None
+    normalised = " ".join(str(value).strip().split())
+    return normalised or None
+
+
+def _linux_cpu_identity(
+    cpuinfo_text: str, *, sysfs_microcode: str | None = None
+) -> dict[str, Any]:
+    """Canonicalise Linux CPU model/capability facts from ``/proc/cpuinfo``.
+
+    Logical-CPU indices, multiplicity, frequencies, cache sizes, and topology are
+    deliberately ignored.  Distinct model and ISA records are retained, so a
+    heterogeneous CPU cannot silently collapse to the first logical processor.
+    """
+    records: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in cpuinfo_text.splitlines():
+        if not line.strip():
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        key, separator, value = line.partition(":")
+        if separator:
+            normalised = _stable_text(value)
+            if normalised is not None:
+                current[key.strip().lower()] = normalised
+    if current:
+        records.append(current)
+
+    vendors: set[str] = set()
+    model_records: dict[str, dict[str, str]] = {}
+    flag_sets: dict[str, list[str]] = {}
+    microcode_versions: set[str] = set()
+    model_keys = (
+        "model name",
+        "cpu family",
+        "model",
+        "stepping",
+        "cpu implementer",
+        "cpu architecture",
+        "cpu variant",
+        "cpu part",
+        "cpu revision",
+    )
+    for record in records:
+        vendor = record.get("vendor_id") or record.get("cpu implementer")
+        if vendor is not None:
+            vendors.add(vendor)
+        model = {key: record[key] for key in model_keys if key in record}
+        if any(key in model for key in ("model name", "model", "cpu part")):
+            model_records[canonical_json(model)] = model
+        flags = {
+            token.lower()
+            for key in ("flags", "features")
+            for token in record.get(key, "").split()
+            if token
+        }
+        if flags:
+            ordered_flags = sorted(flags)
+            flag_sets[canonical_json(ordered_flags)] = ordered_flags
+        microcode = _stable_text(record.get("microcode"))
+        if microcode is not None:
+            microcode_versions.add(microcode.lower())
+    fallback_microcode = _stable_text(sysfs_microcode)
+    if fallback_microcode is not None and not microcode_versions:
+        microcode_versions.add(fallback_microcode.lower())
+
+    if not vendors:
+        raise RuntimeError("formal runtime cannot identify the Linux CPU vendor")
+    if not model_records:
+        raise RuntimeError("formal runtime cannot identify the Linux CPU model")
+    if not flag_sets:
+        raise RuntimeError("formal runtime cannot identify Linux CPU ISA flags")
+    return {
+        "vendor_ids": sorted(vendors),
+        "models": [model_records[key] for key in sorted(model_records)],
+        "isa_flag_sets": [flag_sets[key] for key in sorted(flag_sets)],
+        "microcode_versions": (
+            sorted(microcode_versions) if microcode_versions else None
+        ),
+    }
+
+
+def _darwin_cpu_identity(sysctl_text: str) -> dict[str, Any]:
+    """Canonicalise macOS CPU model/capabilities from stable ``sysctl`` keys."""
+    values: dict[str, str] = {}
+    for line in sysctl_text.splitlines():
+        key, separator, value = line.partition(":")
+        if not separator:
+            key, separator, value = line.partition("=")
+        normalised = _stable_text(value) if separator else None
+        if normalised is not None:
+            values[key.strip()] = normalised
+
+    brand = values.get("machdep.cpu.brand_string")
+    vendor = values.get("machdep.cpu.vendor")
+    if vendor is None and brand is not None and brand.startswith("Apple "):
+        vendor = "Apple"
+    if vendor is None:
+        raise RuntimeError("formal runtime cannot identify the macOS CPU vendor")
+    if brand is None:
+        raise RuntimeError("formal runtime cannot identify the macOS CPU model")
+
+    model_keys = (
+        "machdep.cpu.brand_string",
+        "machdep.cpu.family",
+        "machdep.cpu.model",
+        "machdep.cpu.stepping",
+        "hw.cpufamily",
+        "hw.cpusubfamily",
+    )
+    model = {key: values[key] for key in model_keys if key in values}
+    isa_flags = {
+        token.lower()
+        for key in (
+            "machdep.cpu.features",
+            "machdep.cpu.leaf7_features",
+            "machdep.cpu.extfeatures",
+        )
+        for token in values.get(key, "").split()
+        if token
+    }
+    isa_flags.update(
+        key for key, value in values.items()
+        if key.startswith("hw.optional.") and value == "1"
+    )
+    if not isa_flags:
+        raise RuntimeError("formal runtime cannot identify macOS CPU ISA flags")
+    microcode = _stable_text(values.get("machdep.cpu.microcode_version"))
+    return {
+        "vendor_ids": [vendor],
+        "models": [model],
+        "isa_flag_sets": [sorted(isa_flags)],
+        "microcode_versions": [microcode] if microcode is not None else None,
+    }
+
+
+def _stable_operating_system_identity() -> dict[str, Any]:
+    """Return versioned OS/process ABI facts, excluding per-host identifiers."""
+    system = _stable_text(platform.system())
+    kernel_release = _stable_text(platform.release())
+    machine = _stable_text(platform.machine())
+    if system not in {"Darwin", "Linux"}:
+        raise RuntimeError(f"formal runtime does not support OS {system!r}")
+    if kernel_release is None or machine is None:
+        raise RuntimeError("formal runtime cannot identify the OS ABI")
+    identity: dict[str, Any] = {
+        "system": system,
+        "kernel_release": kernel_release,
+        "process_abi": {
+            "machine": machine,
+            "pointer_bits": int(struct.calcsize("P") * 8),
+            "byteorder": sys.byteorder,
+        },
+    }
+    if system == "Darwin":
+        product_version = _stable_text(platform.mac_ver()[0])
+        if product_version is None:
+            raise RuntimeError("formal runtime cannot identify the macOS version")
+        identity["product_version"] = product_version
+        identity["libc"] = None
+        identity["distribution"] = None
+        return identity
+
+    libc_name, libc_version = (_stable_text(value) for value in platform.libc_ver())
+    if libc_name is None or libc_version is None:
+        try:
+            libc_declaration = _stable_text(os.confstr("CS_GNU_LIBC_VERSION"))
+        except (AttributeError, OSError, ValueError):
+            libc_declaration = None
+        if libc_declaration is not None:
+            libc_name, _, libc_version = libc_declaration.partition(" ")
+            libc_name = _stable_text(libc_name)
+            libc_version = _stable_text(libc_version)
+    if libc_name is None or libc_version is None:
+        raise RuntimeError("formal runtime cannot identify the Linux libc ABI")
+    identity["libc"] = {"implementation": libc_name, "version": libc_version}
+    try:
+        release = platform.freedesktop_os_release()
+    except (AttributeError, OSError):
+        release = {}
+    distribution = {
+        key.lower(): value
+        for key in ("ID", "VERSION_ID")
+        if (value := _stable_text(release.get(key))) is not None
+    }
+    identity["distribution"] = distribution or None
+    return identity
+
+
+def _stable_host_numerical_identity() -> dict[str, Any]:
+    """Bind cache identity to a stable OS/CPU class, not a physical host."""
+    operating_system = _stable_operating_system_identity()
+    if operating_system["system"] == "Linux":
+        try:
+            cpuinfo = Path("/proc/cpuinfo").read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError("formal runtime cannot read /proc/cpuinfo") from exc
+        microcode_path = Path("/sys/devices/system/cpu/microcode/version")
+        try:
+            sysfs_microcode = (
+                microcode_path.read_text(encoding="utf-8")
+                if microcode_path.is_file()
+                else None
+            )
+        except OSError as exc:
+            raise RuntimeError("formal runtime cannot read Linux microcode") from exc
+        cpu = _linux_cpu_identity(
+            cpuinfo, sysfs_microcode=sysfs_microcode
+        )
+    else:
+        try:
+            result = subprocess.run(
+                [DARWIN_SYSCTL_PATH, "-a"],
+                text=True,
+                capture_output=True,
+                check=False,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError as exc:
+            raise RuntimeError("formal runtime cannot execute macOS sysctl") from exc
+        if result.returncode or not result.stdout.strip():
+            raise RuntimeError("formal runtime cannot read macOS CPU sysctls")
+        cpu = _darwin_cpu_identity(result.stdout)
+    return {
+        "operating_system": operating_system,
+        "cpu": cpu,
+        "identity_scope": "stable-os-abi-and-cpu-class-not-physical-host",
+        "cross_hardware_bitwise_reproducibility": "not-guaranteed",
+    }
+
+
+def _canonical_native_library_identities(
+    libraries: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return one deterministic record per loaded native-library identity.
+
+    ``threadpoolctl`` can report the same shared object more than once when it
+    is reached through several import paths.  Handle multiplicity and discovery
+    order are not properties of the numerical runtime, so exact duplicate
+    identities are folded.  Conversely, different binary bytes, version,
+    architecture, API, or threading layer remain different identities and
+    therefore change the runtime hash.  Installation paths are deliberately
+    excluded: relocating identical binaries must neither change the numerical
+    identity nor disclose a builder-specific absolute path.
+
+    Records are ordered lexicographically by their canonical-JSON encoding.
+    Launch-time thread counts are deliberately omitted: the effective
+    single-thread policy is attested separately by ``formal_numerical_policy``.
+    """
+    unique: dict[str, dict[str, Any]] = {}
+    for library in libraries:
+        raw_path = library.get("filepath")
+        filepath: Path | None = None
+        if raw_path not in (None, ""):
+            try:
+                candidate = Path(str(raw_path)).expanduser().resolve()
+                if candidate.is_file():
+                    filepath = candidate
+            except (OSError, RuntimeError):
+                filepath = None
+        binary_sha256: str | None = None
+        binary_bytes: int | None = None
+        if filepath is not None:
+            stat = filepath.stat()
+            binary_bytes = int(stat.st_size)
+            cache_key = (str(filepath), binary_bytes, int(stat.st_mtime_ns))
+            binary_sha256 = _NATIVE_BINARY_HASH_CACHE.get(cache_key)
+            if binary_sha256 is None:
+                binary_sha256 = sha256_file(filepath)
+                _NATIVE_BINARY_HASH_CACHE[cache_key] = binary_sha256
+        identity = {
+            "user_api": library.get("user_api"),
+            "internal_api": library.get("internal_api"),
+            "prefix": library.get("prefix"),
+            "binary_sha256": binary_sha256,
+            "binary_bytes": binary_bytes,
+            "version": library.get("version"),
+            "architecture": library.get("architecture"),
+            "process_abi": {
+                "machine": platform.machine(),
+                "pointer_bits": int(struct.calcsize("P") * 8),
+                "python_cache_tag": getattr(sys.implementation, "cache_tag", None),
+            },
+            "threading_layer": library.get("threading_layer"),
+        }
+        unique[canonical_json(identity)] = identity
+    return [unique[key] for key in sorted(unique)]
+
+
+DEFAULT_SOURCE_PATTERNS = (
+    "src/**/*.py",
+    "scripts/**/*.py",
+    "scripts/**/*.sh",
+    "tests/**/*.py",
+    "protocols/**/*.json",
+    "protocols/**/*.md",
+    ".github/workflows/*.yml",
+    ".github/workflows/*.yaml",
+    "pyproject.toml",
+    "requirements.txt",
+    "requirements-lock.txt",
+)
+
+
+def source_inventory(root: str | Path,
+                     patterns: Iterable[str] = DEFAULT_SOURCE_PATTERNS) -> dict[str, str]:
+    """Hash the code/config files that define a run, independent of Git state."""
+    root = Path(root).resolve()
+    files: dict[str, str] = {}
+    for pattern in patterns:
+        for path in root.glob(pattern):
+            if path.is_file() and "__pycache__" not in path.parts:
+                files[path.relative_to(root).as_posix()] = sha256_file(path)
+    return dict(sorted(files.items()))
+
+
+def source_tree_hash(root: str | Path,
+                     patterns: Iterable[str] = DEFAULT_SOURCE_PATTERNS) -> str:
+    return sha256_json(source_inventory(root, patterns))
+
+
+def git_state(root: str | Path) -> dict[str, Any]:
+    """Best-effort Git provenance; failures are explicit rather than fabricated."""
+    root = Path(root)
+
+    def run(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args], cwd=root, text=True, capture_output=True, check=False
+        )
+
+    commit = run("rev-parse", "HEAD")
+    status = run("status", "--porcelain")
+    if commit.returncode:
+        return {"available": False, "commit": None, "dirty": None}
+    return {
+        "available": True,
+        "commit": commit.stdout.strip(),
+        "dirty": bool(status.stdout.strip()),
+    }
+
+
+@dataclass(frozen=True)
+class RunIdentity:
+    """Stable identity of a resolved experiment."""
+
+    run_id: str
+    panel_sha256: str
+    registry_sha256: str
+    config_sha256: str
+    source_sha256: str
+    runtime_sha256: str
+    input_closure_sha256: str
+    schema_version: str = RUN_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        digest = self.input_closure_sha256
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(
+                "RunIdentity input_closure_sha256 must be a lowercase SHA-256"
+            )
+
+    def as_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
+class RunDirectoryLockError(RuntimeError):
+    """Raised when another process owns an exact formal run directory."""
+
+
+class RunDirectoryLock:
+    """A process-scoped POSIX advisory lock for one content-addressed run.
+
+    The JSON stored beside the run directory is diagnostic only.  In
+    particular, a process crash can leave an apparently ``held`` record behind;
+    the live ``flock`` on this object's open file descriptor is the authority.
+    """
+
+    def __init__(
+        self,
+        *,
+        run_directory: Path,
+        lock_path: Path,
+        run_id: str,
+        handle: TextIO,
+        owner: Mapping[str, Any],
+    ) -> None:
+        self.run_directory = run_directory
+        self.lock_path = lock_path
+        self.run_id = run_id
+        self.owner = dict(owner)
+        self._handle = handle
+        self._owner_pid = os.getpid()
+        self._released = False
+
+    @property
+    def held(self) -> bool:
+        """Whether this process still holds the OS lock."""
+        return not self._released and self._owner_pid == os.getpid()
+
+    def release(self) -> None:
+        """Release once; repeated calls are harmless.
+
+        A forked child must not unlock the parent's shared open-file
+        description.  It only closes its inherited descriptor and lets the
+        parent remain authoritative.
+        """
+        with _RUN_DIRECTORY_LOCKS_GUARD:
+            if self._released:
+                return
+            current = _RUN_DIRECTORY_LOCKS.get(self.lock_path)
+            if current is self:
+                _RUN_DIRECTORY_LOCKS.pop(self.lock_path, None)
+            if self._owner_pid != os.getpid():
+                self._handle.close()
+                self._released = True
+                return
+            try:
+                released = {
+                    **self.owner,
+                    "state": "released",
+                    "released_utc": datetime.now(timezone.utc).isoformat(),
+                }
+                self._handle.seek(0)
+                self._handle.truncate()
+                self._handle.write(canonical_json(released) + "\n")
+                self._handle.flush()
+                os.fsync(self._handle.fileno())
+            finally:
+                try:
+                    fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    self._handle.close()
+                    self._released = True
+
+    def __enter__(self) -> RunDirectoryLock:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.release()
+
+
+_RUN_DIRECTORY_LOCKS: dict[Path, RunDirectoryLock] = {}
+_RUN_DIRECTORY_LOCKS_GUARD = threading.RLock()
+
+
+def run_directory_lock_path(run_directory: str | Path) -> Path:
+    """Return the explicit sibling lock path for a content-addressed run."""
+    requested = Path(run_directory).expanduser()
+    run_dir = requested.parent.resolve() / requested.name
+    if run_dir.name in {"", ".", ".."}:
+        raise ValueError("run directory must have a non-empty run_id component")
+    return run_dir.parent / f".{run_dir.name}.formal-run.lock"
+
+
+def _lock_diagnostic(handle: TextIO) -> object:
+    try:
+        handle.seek(0)
+        raw = handle.read(16_384).strip()
+        if not raw:
+            return {"status": "owner-metadata-not-yet-available"}
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else {"raw": raw}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {"status": "owner-metadata-unreadable"}
+
+
+def acquire_run_directory_lock(
+    run_directory: str | Path, *, run_id: str
+) -> RunDirectoryLock:
+    """Non-blockingly lock one exact run until release or process exit.
+
+    Repeated acquisition for the same run by the same process is idempotent and
+    returns the same lock object.  A competing process fails immediately.  The
+    lock file is deliberately a sibling of the immutable run directory so its
+    mutable owner diagnostics cannot enter scientific artifact inventories.
+    """
+    if type(run_id) is not str or not run_id or Path(run_id).name != run_id:
+        raise ValueError("run_id must be one safe, non-empty path component")
+    requested = Path(run_directory).expanduser()
+    run_dir = requested.parent.resolve() / requested.name
+    if run_dir.name != run_id:
+        raise ValueError("run directory basename must exactly match run_id")
+    if run_dir.is_symlink() or (run_dir.exists() and not run_dir.is_dir()):
+        raise RunDirectoryLockError(
+            "formal run directory is a symlink or non-directory"
+        )
+    lock_path = run_directory_lock_path(run_dir)
+    with _RUN_DIRECTORY_LOCKS_GUARD:
+        existing = _RUN_DIRECTORY_LOCKS.get(lock_path)
+        if existing is not None and existing.held:
+            if existing.run_id != run_id:  # pragma: no cover - key construction guards this
+                raise RunDirectoryLockError("run lock registry identity collision")
+            return existing
+        if existing is not None:
+            # A forked child inherits the Python registry and descriptor, but
+            # must not unlock the parent's shared open-file description.  Its
+            # release path only closes that inherited duplicate before this
+            # process attempts a fresh open.
+            existing.release()
+            _RUN_DIRECTORY_LOCKS.pop(lock_path, None)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            descriptor = _open_owner_private_lock_file(lock_path)
+        except (OSError, RuntimeError) as exc:
+            raise RunDirectoryLockError(
+                f"formal run lock is unsafe: {lock_path}"
+            ) from exc
+        handle = os.fdopen(descriptor, "r+", encoding="utf-8", newline="\n")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                handle.close()
+                raise
+            diagnostic = _lock_diagnostic(handle)
+            handle.close()
+            raise RunDirectoryLockError(
+                "formal run is already locked by another process: "
+                f"run_id={run_id}; lock={lock_path}; owner="
+                f"{canonical_json(diagnostic)}; the OS advisory lock is authoritative"
+            ) from exc
+        owner = {
+            "format": RUN_LOCK_SCHEMA_VERSION,
+            "state": "held",
+            "run_id": run_id,
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "started_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            handle.seek(0)
+            handle.truncate()
+            handle.write(canonical_json(owner) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+            raise
+        lock = RunDirectoryLock(
+            run_directory=run_dir,
+            lock_path=lock_path,
+            run_id=run_id,
+            handle=handle,
+            owner=owner,
+        )
+        _RUN_DIRECTORY_LOCKS[lock_path] = lock
+        return lock
+
+
+def release_run_directory_lock(run_directory: str | Path) -> bool:
+    """Explicitly release this process's lock, returning whether one existed."""
+    lock_path = run_directory_lock_path(run_directory)
+    with _RUN_DIRECTORY_LOCKS_GUARD:
+        lock = _RUN_DIRECTORY_LOCKS.get(lock_path)
+        if lock is None or not lock.held:
+            return False
+        # Keep registry lookup and release atomic with respect to another
+        # thread's idempotent acquire; the guard is deliberately re-entrant.
+        lock.release()
+        return True
+
+
+def _release_all_run_directory_locks() -> None:
+    with _RUN_DIRECTORY_LOCKS_GUARD:
+        locks = list(_RUN_DIRECTORY_LOCKS.values())
+    for lock in reversed(locks):
+        try:
+            lock.release()
+        except Exception:
+            # Interpreter shutdown must continue; the OS closes the descriptor.
+            pass
+
+
+atexit.register(_release_all_run_directory_locks)
+
+
+def resolve_run_identity(*, root: str | Path, panel: str | Path,
+                         registry: str | Path, config: Any,
+                         input_closure_sha256: str,
+                         source_patterns: Iterable[str] = DEFAULT_SOURCE_PATTERNS
+                         ) -> RunIdentity:
+    """Resolve a content address from data, registry, configuration, and code."""
+    parts = {
+        "schema_version": RUN_SCHEMA_VERSION,
+        "panel_sha256": sha256_file(panel),
+        "registry_sha256": sha256_file(registry),
+        "config_sha256": sha256_json(config),
+        "source_sha256": source_tree_hash(root, source_patterns),
+        "runtime_sha256": sha256_json(numerical_runtime_contract()),
+        "input_closure_sha256": input_closure_sha256,
+    }
+    return RunIdentity(run_id=sha256_json(parts)[:20], **parts)
+
+
+def numerical_runtime_contract() -> dict[str, Any]:
+    """Return stable numerical-runtime facts that participate in cache identity.
+
+    This intentionally excludes hostname, serial numbers, timestamps, CPU counts,
+    frequencies, and other per-host or launch-time facts.  The stable OS ABI, CPU
+    vendor/model/ISA flags, available microcode version, exact packages, and
+    accelerator versions do enter the identity.  This prevents cross-host-class
+    cache reuse; it does not claim bitwise reproducibility across hardware.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    distributions: dict[str, str | None] = {}
+    for distribution in (
+        "numpy", "pandas", "scipy", "scikit-learn", "torch", "lightgbm",
+        "pyarrow", "statsmodels",
+    ):
+        try:
+            distributions[distribution] = version(distribution)
+        except PackageNotFoundError:
+            distributions[distribution] = None
+    contract: dict[str, Any] = {
+        "python_implementation": platform.python_implementation(),
+        "python_version": platform.python_version(),
+        "distributions": distributions,
+        "formal_numerical_policy": formal_numerical_policy(),
+        "host_numerical_identity": _stable_host_numerical_identity(),
+    }
+    try:
+        from threadpoolctl import threadpool_info
+
+        native_libraries = _canonical_native_library_identities(
+            threadpool_info()
+        )
+        if not native_libraries or any(
+            value.get("binary_sha256") is None for value in native_libraries
+        ):
+            raise RuntimeError(
+                "formal runtime cannot content-bind every loaded native library"
+            )
+        contract["native_libraries"] = native_libraries
+    except ImportError:  # pragma: no cover - dependency is required formally
+        contract["native_libraries"] = None
+    try:
+        import torch
+
+        contract["torch_runtime"] = {
+            "cuda": torch.version.cuda,
+            "cudnn": torch.backends.cudnn.version(),
+            "mps_built": bool(
+                hasattr(torch.backends, "mps") and torch.backends.mps.is_built()
+            ),
+        }
+    except ImportError:  # pragma: no cover - torch is a project dependency
+        contract["torch_runtime"] = None
+    return contract
+
+
+def environment_fingerprint() -> dict[str, Any]:
+    """Runtime facts for audit logs; these do not enter ``run_id``."""
+    runtime_contract = numerical_runtime_contract()
+    info: dict[str, Any] = {
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "numerical_runtime_contract": runtime_contract,
+        "numerical_runtime_sha256": sha256_json(runtime_contract),
+    }
+    try:
+        import numpy as np
+
+        info["numpy"] = np.__version__
+    except ImportError:  # pragma: no cover - package dependency in real runs
+        pass
+    try:
+        import pandas as pd
+
+        info["pandas"] = pd.__version__
+    except ImportError:  # pragma: no cover
+        pass
+    for distribution, key in (
+        ("scipy", "scipy"),
+        ("scikit-learn", "scikit_learn"),
+        ("lightgbm", "lightgbm"),
+        ("pyarrow", "pyarrow"),
+        ("statsmodels", "statsmodels"),
+    ):
+        try:
+            from importlib.metadata import version
+
+            info[key] = version(distribution)
+        except Exception:  # pragma: no cover - optional diagnostic only
+            pass
+    try:
+        from threadpoolctl import threadpool_info
+
+        info["native_threadpools"] = threadpool_info()
+    except Exception:  # pragma: no cover - optional diagnostic only
+        pass
+    try:
+        import torch
+
+        info.update({
+            "torch": torch.__version__,
+            "cuda_available": torch.cuda.is_available(),
+            "cuda_version": torch.version.cuda,
+            "cudnn_version": torch.backends.cudnn.version(),
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "cudnn_deterministic": torch.backends.cudnn.deterministic,
+            "cudnn_benchmark": torch.backends.cudnn.benchmark,
+            "torch_num_threads": torch.get_num_threads(),
+            "torch_num_interop_threads": torch.get_num_interop_threads(),
+            "mps_available": bool(
+                hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+            ),
+            "determinism_environment": {
+                name: os.environ.get(name)
+                for name in (
+                    "PYTHONHASHSEED", "CUBLAS_WORKSPACE_CONFIG",
+                    "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                )
+            },
+        })
+        if torch.cuda.is_available():
+            properties = torch.cuda.get_device_properties(0)
+            info["gpu"] = {
+                "name": properties.name,
+                "capability": list(torch.cuda.get_device_capability(0)),
+                "total_memory": int(properties.total_memory),
+                "device_count": int(torch.cuda.device_count()),
+            }
+    except ImportError:  # pragma: no cover
+        pass
+    return info
+
+
+def _fsync_parent_directory(path: Path) -> None:
+    """Make a completed rename durable in its containing directory."""
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(path.parent, flags)
+    except OSError:
+        if os.name == "nt":  # Windows has no portable directory fsync.
+            return
+        raise
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        if os.name != "nt":
+            raise
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write_bytes(
+    path: str | Path,
+    payload: bytes,
+    *,
+    publication_guard: Callable[[], object] | None = None,
+) -> None:
+    """Write, optionally guard the staged bytes, then atomically replace.
+
+    ``publication_guard`` runs after the complete temporary file is durable but
+    before it can replace the authoritative path.  Formal numerical entrypoints
+    use this hook to prove that the live BLAS/OpenMP policy still holds at the
+    exact publication boundary.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if publication_guard is not None:
+            publication_guard()
+        os.replace(tmp_name, path)
+        _fsync_parent_directory(path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def atomic_write_json(
+    path: str | Path,
+    value: Any,
+    *,
+    publication_guard: Callable[[], object] | None = None,
+) -> None:
+    payload = (json.dumps(_jsonable(value), sort_keys=True, indent=2, allow_nan=False) + "\n")
+    atomic_write_bytes(
+        path,
+        payload.encode("utf-8"),
+        publication_guard=publication_guard,
+    )
+
+
+def atomic_write_parquet(
+    frame: Any,
+    path: str | Path,
+    *,
+    publication_guard: Callable[[], object] | None = None,
+    **kwargs: Any,
+) -> None:
+    """Stage Parquet, optionally guard it, then atomically publish it."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    os.close(fd)
+    try:
+        frame.to_parquet(tmp_name, **kwargs)
+        # Ensure bytes are durable before replacing a previous valid artifact.
+        with open(tmp_name, "rb") as handle:
+            os.fsync(handle.fileno())
+        if publication_guard is not None:
+            publication_guard()
+        os.replace(tmp_name, path)
+        _fsync_parent_directory(path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def sidecar_path(artifact: str | Path) -> Path:
+    artifact = Path(artifact)
+    return artifact.with_name(artifact.name + ".meta.json")
+
+
+def validate_artifact_sidecar(
+    artifact: str | Path,
+    *,
+    identity: RunIdentity | None = None,
+    schema: str | None = None,
+    kind: str | None = None,
+) -> dict[str, Any]:
+    """Strictly validate an artifact and its complete lineage sidecar."""
+    artifact = Path(artifact)
+    sidecar = sidecar_path(artifact)
+    if not artifact.is_file() or not sidecar.is_file():
+        raise ValueError("artifact or lineage sidecar is absent")
+    try:
+        metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("artifact lineage sidecar is invalid JSON") from exc
+    expected_keys = {
+        "schema_version", "kind", "artifact", "artifact_sha256",
+        "artifact_bytes", "content_schema", "run", "parents", "extra",
+        "created_utc",
+    }
+    if not isinstance(metadata, dict) or set(metadata) != expected_keys:
+        raise ValueError("artifact lineage sidecar schema is not exact")
+    try:
+        created = datetime.fromisoformat(str(metadata["created_utc"]))
+    except ValueError as exc:
+        raise ValueError("artifact lineage timestamp is invalid") from exc
+    if created.tzinfo is None or created.utcoffset() is None:
+        raise ValueError("artifact lineage timestamp is not timezone-aware")
+    if (
+        metadata["schema_version"] != ARTIFACT_SCHEMA_VERSION
+        or metadata["artifact"] != artifact.name
+        or metadata["artifact_bytes"] != artifact.stat().st_size
+        or metadata["artifact_sha256"] != sha256_file(artifact)
+        or not isinstance(metadata["kind"], str)
+        or not metadata["kind"]
+        or not isinstance(metadata["parents"], dict)
+        or not isinstance(metadata["extra"], dict)
+    ):
+        raise ValueError("artifact bytes or lineage fields changed")
+    parents = metadata["parents"]
+    if any(
+        not isinstance(name, str)
+        or not name
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        for name, digest in parents.items()
+    ):
+        raise ValueError("artifact parent registry is malformed")
+    run = metadata["run"]
+    run_keys = {
+        "run_id", "panel_sha256", "registry_sha256", "config_sha256",
+        "source_sha256", "runtime_sha256", "input_closure_sha256",
+        "schema_version",
+    }
+    if (
+        not isinstance(run, dict)
+        or set(run) != run_keys
+        or run.get("schema_version") != RUN_SCHEMA_VERSION
+        or not isinstance(run.get("run_id"), str)
+        or not run["run_id"]
+        or any(
+            not isinstance(run.get(field), str) or len(run[field]) != 64
+            for field in (
+                "panel_sha256", "registry_sha256", "config_sha256",
+                "source_sha256", "runtime_sha256", "input_closure_sha256",
+            )
+        )
+        or any(
+            any(character not in "0123456789abcdef" for character in run[field])
+            for field in (
+                "panel_sha256", "registry_sha256", "config_sha256",
+                "source_sha256", "runtime_sha256", "input_closure_sha256",
+            )
+        )
+    ):
+        raise ValueError("artifact run identity is malformed")
+    if identity is not None and run != identity.as_dict():
+        raise ValueError("artifact belongs to another run identity")
+    if schema is not None and metadata["content_schema"] != schema:
+        raise ValueError("artifact content schema changed")
+    if kind is not None and metadata["kind"] != kind:
+        raise ValueError("artifact kind changed")
+    return metadata
+
+
+def seal_artifact(artifact: str | Path, identity: RunIdentity, *,
+                  kind: str, schema: str | None = None,
+                  parents: Mapping[str, str] | None = None,
+                  extra: Mapping[str, Any] | None = None,
+                  publication_guard: Callable[[], object] | None = None,
+                  ) -> Path:
+    """Write a validated lineage sidecar for an already completed artifact."""
+    artifact = Path(artifact)
+    if not artifact.is_file():
+        raise FileNotFoundError(artifact)
+    stable = {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "kind": kind,
+        "artifact": artifact.name,
+        "artifact_sha256": sha256_file(artifact),
+        "artifact_bytes": artifact.stat().st_size,
+        "content_schema": schema,
+        "run": identity.as_dict(),
+        "parents": dict(sorted((parents or {}).items())),
+        "extra": _jsonable(extra or {}),
+    }
+    destination = sidecar_path(artifact)
+    if destination.is_file():
+        try:
+            existing = json.loads(destination.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            existing = None
+        if isinstance(existing, dict):
+            existing_stable = dict(existing)
+            created = existing_stable.pop("created_utc", None)
+            try:
+                parsed_created = datetime.fromisoformat(str(created))
+            except ValueError:
+                parsed_created = None
+            if (
+                existing_stable == stable
+                and parsed_created is not None
+                and parsed_created.tzinfo is not None
+                and parsed_created.utcoffset() is not None
+            ):
+                # A sidecar is part of later create-only bundle identities.
+                # Preserve its exact bytes when the scientific lineage is
+                # unchanged; a wall-clock reseal must not make a retry differ.
+                if publication_guard is not None:
+                    publication_guard()
+                return destination
+    metadata = {
+        **stable,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    atomic_write_json(
+        destination,
+        metadata,
+        publication_guard=publication_guard,
+    )
+    return destination
+
+
+def cache_is_valid(artifact: str | Path, identity: RunIdentity, *,
+                   schema: str | None = None) -> bool:
+    """Return true only for an intact artifact produced by the same run."""
+    try:
+        validate_artifact_sidecar(
+            artifact,
+            identity=identity,
+            schema=schema,
+        )
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def initialise_run_directory(
+    root: str | Path,
+    identity: RunIdentity,
+    config: Any,
+    *,
+    provenance: Mapping[str, Any] | None = None,
+    publication_guard: Callable[[], object] | None = None,
+) -> Path:
+    """Lock, then create an immutable run directory and its audit record.
+
+    The process-scoped lock is acquired before ``run.json`` or any cache path is
+    created and remains held until explicit release or process termination.
+    Read-only validators do not call this initializer and therefore never take
+    or mutate a lock.
+    """
+    runs_root = Path(root).expanduser().resolve()
+    run_dir = runs_root / identity.run_id
+    lock = acquire_run_directory_lock(run_dir, run_id=identity.run_id)
+    try:
+        if run_dir.is_symlink() or (run_dir.exists() and not run_dir.is_dir()):
+            raise RuntimeError("formal run directory is a symlink or non-directory")
+        if not run_dir.exists():
+            run_dir.mkdir(mode=0o700)
+        if run_dir.resolve() != run_dir or run_dir.parent != runs_root:
+            raise RuntimeError("formal run directory escapes its canonical runs root")
+        metadata_path = run_dir / "run.json"
+        if metadata_path.is_symlink() or (
+            metadata_path.exists() and not metadata_path.is_file()
+        ):
+            raise RuntimeError("formal run manifest is a symlink or non-file")
+        payload = {
+            "schema_version": RUN_SCHEMA_VERSION,
+            "identity": identity.as_dict(),
+            "resolved_config": _jsonable(config),
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "environment": environment_fingerprint(),
+            "git": git_state(runs_root.parents[1]),
+            "provenance": _jsonable(provenance or {}),
+        }
+        if metadata_path.exists():
+            old = json.loads(metadata_path.read_text())
+            if (
+                old.get("identity") != identity.as_dict()
+                or old.get("resolved_config") != _jsonable(config)
+            ):
+                raise RuntimeError(f"run directory collision: {run_dir}")
+            if publication_guard is not None:
+                publication_guard()
+        else:
+            atomic_write_json(
+                metadata_path,
+                payload,
+                publication_guard=publication_guard,
+            )
+        return run_dir
+    except BaseException:
+        lock.release()
+        raise

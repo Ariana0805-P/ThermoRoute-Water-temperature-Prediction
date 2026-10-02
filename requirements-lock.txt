@@ -1,0 +1,23 @@
+# Pinned direct dependency versions for the Route-A analysis and its build.
+# Transitive dependencies are resolved by pip for the target Python 3.12 host.
+# Install with:
+#     pip install -r requirements-lock.txt
+# Built and tested on Python 3.12; see requirements.txt for looser version floors.
+
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.13.1
+scikit-learn==1.5.1
+lightgbm==4.6.0
+torch==2.12.0
+matplotlib==3.9.2
+statsmodels==0.14.2
+pyarrow==24.0.0
+pytest==8.0.0
+ruff==0.15.14
+mypy==1.11.2
+dataretrieval==1.2.0
+PyYAML==6.0.1
+pypandoc_binary==1.17    # canonical Markdown -> AGU TeX check; optional PDF/DOCX builds
+python-docx==1.2.0       # legacy Word manuscript renderer
+setuptools==81.0.0       # pyproject build backend used by the editable install

@@ -1,0 +1,185 @@
+{
+  "format": "thermoroute.route-a-temporal-coverage-policy.v1",
+  "status": "FROZEN_PRELABEL_OUTCOME_FREE",
+  "policy_id": "route-a-temporal-coverage-audit-001",
+  "recorded_date": "2026-07-22",
+  "post_2020_wtemp_requested_or_inspected": false,
+  "outcome_independent_design": true,
+  "route_a_target_interval": {
+    "start": "2021-01-01",
+    "end": "2023-12-31",
+    "inclusive": true
+  },
+  "scope": {
+    "cohorts": ["temporal", "external"],
+    "coverage_scope": "both_frozen_cohorts",
+    "comparison_sensitivity_scope": "temporal_primary_five_tests_only",
+    "not_a_missing_at_random_assessment": true,
+    "not_all_calendar_day_performance": true,
+    "core_status_requires_receipt_binding": true
+  },
+  "formal_comparisons": [
+    {
+      "test_id": "H1-h1-vs-damped",
+      "candidate": "ThermoRoute",
+      "reference": "DampedPersistence",
+      "horizon": 1,
+      "margin_c": 0.0
+    },
+    {
+      "test_id": "H1-h3-vs-damped",
+      "candidate": "ThermoRoute",
+      "reference": "DampedPersistence",
+      "horizon": 3,
+      "margin_c": 0.0
+    },
+    {
+      "test_id": "H1-h7-vs-damped",
+      "candidate": "ThermoRoute",
+      "reference": "DampedPersistence",
+      "horizon": 7,
+      "margin_c": 0.0
+    },
+    {
+      "test_id": "H2-h3-vs-lightgbm",
+      "candidate": "ThermoRoute",
+      "reference": "LightGBM",
+      "horizon": 3,
+      "margin_c": 0.05
+    },
+    {
+      "test_id": "H2-h7-vs-lightgbm",
+      "candidate": "ThermoRoute",
+      "reference": "LightGBM",
+      "horizon": 7,
+      "margin_c": 0.05
+    }
+  ],
+  "model_registry_by_cohort": {
+    "temporal": [
+      "Persistence",
+      "DampedPersistence",
+      "Climatology",
+      "LightGBM",
+      "LSTM",
+      "ThermoRoute",
+      "DampedPriorOnly",
+      "TR-noDynamicPrior",
+      "TR-fixedKappa",
+      "TR-noRouter",
+      "TR-noMoE",
+      "TR-noTCN",
+      "TR-unbounded"
+    ],
+    "external": [
+      "Persistence",
+      "DampedPersistence",
+      "Climatology",
+      "LightGBM",
+      "LSTM",
+      "ThermoRoute"
+    ]
+  },
+  "calendar_contract": {
+    "classification_date": "target_date",
+    "year_rule": "Gregorian_calendar_year_of_target_date",
+    "season_order": ["DJF", "MAM", "JJA", "SON"],
+    "season_months": {
+      "DJF": [12, 1, 2],
+      "MAM": [3, 4, 5],
+      "JJA": [6, 7, 8],
+      "SON": [9, 10, 11]
+    },
+    "season_role": "deterministic_meteorological_reporting_partition_not_ecological_life_stage_or_watershed_specific_season",
+    "horizons_days": [1, 3, 7],
+    "context_length_days": 32,
+    "calendar_opportunity": "issue_and_target_inside_interval_and_exact_daily_context_rows_present",
+    "valid_key": "calendar_opportunity_and_issue_WTEMP_observed_and_target_WTEMP_observed"
+  },
+  "coverage_contract": {
+    "minimum_valid_targets_per_station_horizon": 100,
+    "all_site_horizon_year_season_cells_required_including_zero": true,
+    "availability_registry_must_reconstruct_exactly": true,
+    "all_frozen_models_must_share_exact_key_and_y_true_summaries": true,
+    "zero_key_horizon_or_cohort_is_legal_when_explicitly_audited": true,
+    "availability_may_not_replace_or_filter_a_frozen_site": true,
+    "coverage_balance_changes_primary_reportability": false
+  },
+  "sensitivity_contract": {
+    "role": "DESCRIPTIVE_NOT_IN_CONFIRMATORY_FAMILY",
+    "formal_comparison_count": 5,
+    "comparison_models": ["ThermoRoute", "DampedPersistence", "LightGBM"],
+    "all_12_cells_nonempty": "primary_reportable_station_has_at_least_one_valid_key_in_each_of_three_years_by_four_seasons",
+    "equal_cell_station_rmse": "sqrt_of_unweighted_mean_of_the_twelve_within_cell_MSE_values",
+    "leave_one_year": "same_all_12_cells_nonempty_stations_and_equal_weight_over_remaining_eight_cells",
+    "leave_one_season": "same_all_12_cells_nonempty_stations_and_equal_weight_over_remaining_nine_cells",
+    "frozen_candidate_order": [
+      "equal_12cell",
+      "leave_one_year_2021",
+      "leave_one_year_2022",
+      "leave_one_year_2023",
+      "leave_one_season_DJF",
+      "leave_one_season_MAM",
+      "leave_one_season_JJA",
+      "leave_one_season_SON"
+    ],
+    "unfavorable_direction": "larger_candidate_minus_reference_effect_is_more_unfavorable",
+    "unfavorable_selection_rule": "maximum_descriptive_median_effect_c_with_first_frozen_candidate_order_entry_winning_exact_ties",
+    "all_eight_candidates_must_be_reported": true,
+    "no_eligible_station_requires_explicit_null_value_and_source": true,
+    "does_not_establish_year_or_season_stability": true,
+    "retraining_or_recalibration_performed": false,
+    "favorable_sensitivity_may_rescue_primary_result": false,
+    "unfavorable_sensitivity_must_be_reported": true,
+    "sensitivity_changes_primary_result_or_decision": false
+  },
+  "formal_statistics_contract": {
+    "allowed_status": [
+      "ESTIMABLE",
+      "NOT_ESTIMABLE_INSUFFICIENT_STATIONS_OR_CLUSTERS"
+    ],
+    "estimable_effect_must_exactly_match_prediction_derived_effect": true,
+    "not_estimable_formal_effect_must_be_null": true,
+    "prediction_derived_descriptive_effect_never_upgrades_inference": true
+  },
+  "source_binding_contract": {
+    "required_keys": [
+      "policy",
+      "protocol",
+      "acquisition_manifest",
+      "temporal_normalized_outcomes",
+      "external_normalized_outcomes",
+      "temporal_site_registry",
+      "external_site_registry",
+      "temporal_full_predictions",
+      "external_full_predictions",
+      "availability_registry",
+      "statistics"
+    ],
+    "binding_fields": ["path", "sha256"],
+    "canonical_repository_relative_posix_path_required": true,
+    "physical_file_verification_delegated_to_opening_release_wrapper": true,
+    "full_upstream_files_are_closed_by_sha256": true,
+    "core_semantic_digests_cover_declared_projection_only": true,
+    "unconsumed_upstream_fields_are_not_silently_claimed_as_validated": true
+  },
+  "declared_projection_contract": {
+    "missing_unknown_duplicate_or_tampered_declared_values_fail_closed": true,
+    "extra_upstream_fields_are_not_consumed": true,
+    "extra_upstream_fields_remain_covered_by_full_file_source_binding": true
+  },
+  "prohibited_sensitivity_outputs": [
+    "p_value",
+    "confidence_interval",
+    "Holm_adjustment",
+    "pass_fail_decision"
+  ],
+  "integrity_contract": {
+    "canonical_chunked_semantic_digest_for_consumed_rows": true,
+    "canonical_document_self_hash": true,
+    "exact_recomputation_required": true,
+    "rewriting_only_the_self_hash_cannot_validate_changed_evidence": true
+  },
+  "output_artifact": "trusted/temporal_coverage_audit_v1.json",
+  "policy_self_sha256": "9b4d6c784bb265b4022ea5d76eac867174e808a3e570e612b04a50054f15157e"
+}
